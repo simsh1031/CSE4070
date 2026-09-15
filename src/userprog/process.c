@@ -21,7 +21,7 @@
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
-/* Starts a new thread running a user program loaded from
+/* Starts a new thread  ning a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
@@ -213,7 +213,22 @@ load (const char *file_name, void (**eip) (void), void **esp)
   struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
+  char *cmdline = NULL;
+  char **argv = NULL;
+  char *token, *save_ptr;
   int i;
+
+  /* ELF를 열기 위해 실행 파일명만 먼저 분리한다. */
+  cmdline = palloc_get_page (0);
+  if (cmdline == NULL)
+    goto done;
+  if (strlcpy (cmdline, file_name, PGSIZE) >= PGSIZE)
+    goto done;
+  token = strtok_r (cmdline, " ", &save_ptr);
+  if (token == NULL)
+    goto done;
+  file_name = token;
+  strlcpy (t->name, file_name, sizeof t->name);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -305,6 +320,63 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp))
     goto done;
 
+  {
+    size_t size = 0;
+    size_t padding;
+    char *sp = *esp;
+    char **user_argv;
+    int argc = 0;
+
+    /* 인자를 모두 파싱한 뒤 사용자 스택에 배치한다. */
+    argv = palloc_get_page (0);
+    if (argv == NULL)
+      goto done;
+    for (; token != NULL; token = strtok_r (NULL, " ", &save_ptr))
+      {
+        if ((size_t) argc >= PGSIZE / sizeof *argv)
+          goto done;
+        argv[argc++] = token;
+      }
+
+    /* 문자열뿐 아니라 포인터와 호출 프레임도 한 페이지 안에 들어가야 한다. */
+    for (i = 0; i < argc; i++)
+      {
+        size_t length = strlen (argv[i]) + 1;
+        if (length > PGSIZE - size)
+          goto done;
+        size += length;
+      }
+    padding = (4 - size % 4) % 4;
+    if (size + padding > PGSIZE
+        || (size_t) argc + 4 > (PGSIZE - size - padding) / 4)
+      goto done;
+
+    for (i = argc - 1; i >= 0; i--)
+      {
+        size_t length = strlen (argv[i]) + 1;
+        sp -= length;
+        memcpy (sp, argv[i], length);
+        argv[i] = sp;
+      }
+    sp -= padding;
+    memset (sp, 0, padding);
+    sp -= sizeof (char *);
+    *(char **) sp = NULL;
+    for (i = argc - 1; i >= 0; i--)
+      {
+        sp -= sizeof (char *);
+        *(char **) sp = argv[i];
+      }
+    user_argv = (char **) sp;
+    sp -= sizeof (char **);
+    *(char ***) sp = user_argv;
+    sp -= sizeof (int);
+    *(int *) sp = argc;
+    sp -= sizeof (void *);
+    *(void **) sp = NULL;
+    *esp = sp;
+  }
+
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
@@ -313,6 +385,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
  done:
   /* We arrive here whether the load is successful or not. */
   file_close (file);
+  palloc_free_page (argv);
+  palloc_free_page (cmdline);
   return success;
 }
 
