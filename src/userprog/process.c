@@ -15,33 +15,89 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+/* 스레드가 먼저 해제되어도 부모가 종료 상태를 읽을 수 있어야 한다. */
+struct child_status
+  {
+    tid_t tid;
+    int status;
+    int refs;
+    bool load_success;
+    char *cmdline;
+    struct semaphore loaded;
+    struct semaphore exited;
+    struct list_elem elem;
+  };
+
+static struct lock load_lock;
+static void release_child (struct child_status *);
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
-/* Starts a new thread  ning a user program loaded from
-   FILENAME.  The new thread may be scheduled (and may even exit)
-   before process_execute() returns.  Returns the new process's
-   thread id, or TID_ERROR if the thread cannot be created. */
+void
+process_init (void)
+{
+  lock_init (&load_lock);
+}
+
+static void
+release_child (struct child_status *child)
+{
+  enum intr_level old_level = intr_disable ();
+  bool last = --child->refs == 0;
+  intr_set_level (old_level);
+  if (last)
+    free (child);
+}
+
+/* 자식의 생성뿐 아니라 실행 파일 로딩 결과까지 기다린다. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
   char *fn_copy;
+  struct child_status *child;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  if (strlcpy (fn_copy, file_name, PGSIZE) >= PGSIZE)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  child = malloc (sizeof *child);
+  if (child == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  child->status = -1;
+  child->refs = 2;
+  child->load_success = false;
+  child->cmdline = fn_copy;
+  sema_init (&child->loaded, 0);
+  sema_init (&child->exited, 0);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name, PRI_DEFAULT, start_process, child);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (fn_copy);
+      free (child);
+      return TID_ERROR;
+    }
+  child->tid = tid;
+  list_push_back (&thread_current ()->children, &child->elem);
+  sema_down (&child->loaded);
+  if (!child->load_success)
+    {
+      process_wait (tid);
+      return TID_ERROR;
+    }
   return tid;
 }
 
@@ -50,7 +106,8 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  struct child_status *child = file_name_;
+  char *save_ptr;
   struct intr_frame if_;
   bool success;
 
@@ -59,10 +116,16 @@ start_process (void *file_name_)
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  thread_current ()->child_status = child;
+  lock_acquire (&load_lock);
+  success = load (child->cmdline, &if_.eip, &if_.esp);
+  lock_release (&load_lock);
+  /* 종료 메시지에는 길이가 제한된 thread 이름 대신 전체 파일명을 쓴다. */
+  strtok_r (child->cmdline, " ", &save_ptr);
+  child->load_success = success;
+  sema_up (&child->loaded);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
   if (!success) 
     thread_exit ();
 
@@ -82,12 +145,26 @@ start_process (void *file_name_)
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
    immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+ */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid)
 {
+  struct list *children = &thread_current ()->children;
+  struct list_elem *e;
+
+  for (e = list_begin (children); e != list_end (children); e = list_next (e))
+    {
+      struct child_status *child = list_entry (e, struct child_status, elem);
+      if (child->tid == child_tid)
+        {
+          int status;
+          list_remove (e);
+          sema_down (&child->exited);
+          status = child->status;
+          release_child (child);
+          return status;
+        }
+    }
   return -1;
 }
 
@@ -97,6 +174,22 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  struct child_status *child = cur->child_status;
+
+  if (child != NULL)
+    {
+      if (child->load_success)
+        {
+          const char *name = child->cmdline;
+          while (*name == ' ')
+            name++;
+          printf ("%s: exit(%d)\n", name, cur->exit_status);
+        }
+      palloc_free_page (child->cmdline);
+    }
+  while (!list_empty (&cur->children))
+    release_child (list_entry (list_pop_front (&cur->children),
+                               struct child_status, elem));
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -113,6 +206,13 @@ process_exit (void)
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
+    }
+  if (child != NULL)
+    {
+      child->status = cur->exit_status;
+      sema_up (&child->exited);
+      cur->child_status = NULL;
+      release_child (child);
     }
 }
 

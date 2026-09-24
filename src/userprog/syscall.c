@@ -2,18 +2,23 @@
 #include <stdio.h>
 #include <string.h>
 #include <syscall-nr.h>
+#include "devices/input.h"
+#include "devices/shutdown.h"
 #include "threads/interrupt.h"
 #include "threads/pte.h"
 #include "threads/thread.h"
 #include "userprog/pagedir.h"
+#include "userprog/process.h"
 
 static void syscall_handler (struct intr_frame *);
 static bool check_buffer (const void *, size_t, bool);
 static bool check_string (const char *);
+static void syscall_exit (int status) NO_RETURN;
 
 void
 syscall_init (void) 
 {
+  process_init ();
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
@@ -21,7 +26,7 @@ static void
 syscall_handler (struct intr_frame *f)
 {
   uint32_t number;
-  uint32_t args[3];
+  uint32_t args[4];
   size_t argc;
   uintptr_t esp = (uintptr_t) f->esp;
 
@@ -37,11 +42,15 @@ syscall_handler (struct intr_frame *f)
     case SYS_EXIT:
     case SYS_EXEC:
     case SYS_WAIT:
+    case SYS_FIBONACCI:
       argc = 1;
       break;
     case SYS_READ:
     case SYS_WRITE:
       argc = 3;
+      break;
+    case SYS_MAX_OF_FOUR_INT:
+      argc = 4;
       break;
     default:
       goto invalid;
@@ -55,36 +64,61 @@ syscall_handler (struct intr_frame *f)
       memcpy (args, user_args, argc * sizeof *args);
     }
 
-  /* 4단계에서 각 API의 실제 반환값으로 대체한다. */
-  f->eax = -1;
   switch (number)
     {
+    case SYS_FIBONACCI:
+      f->eax = fibonacci ((int) args[0]);
+      break;
+    case SYS_MAX_OF_FOUR_INT:
+      f->eax = max_of_four_int ((int) args[0], (int) args[1],
+                                (int) args[2], (int) args[3]);
+      break;
     case SYS_HALT:
-      /* TODO: halt API 연결. 연결 전에는 사용자 코드로 복귀하지 않는다. */
-      thread_exit ();
+      shutdown_power_off ();
     case SYS_EXIT:
-      /* TODO: exit((int) args[0]) 및 부모에게 종료 상태 전달. */
-      thread_exit ();
+      syscall_exit ((int) args[0]);
     case SYS_EXEC:
       if (!check_string ((const char *) args[0]))
         goto invalid;
-      /* TODO: 명령행을 커널 버퍼로 복사하고 exec 결과를 eax에 저장. */
+      /* process_execute가 자식 생성 전에 명령행을 커널 페이지로 복사한다. */
+      f->eax = process_execute ((const char *) args[0]);
       break;
     case SYS_WAIT:
-      /* TODO: wait((tid_t) args[0]) 결과를 eax에 저장. */
+      f->eax = process_wait ((tid_t) args[0]);
       break;
     case SYS_READ:
     case SYS_WRITE:
       if (!check_buffer ((const void *) args[1], args[2],
                          number == SYS_READ))
         goto invalid;
-      /* TODO: read/write((int) args[0], buffer, size) 결과를 eax에 저장. */
+      if (number == SYS_READ && (int) args[0] == 0)
+        {
+          uint8_t *buffer = (uint8_t *) args[1];
+          unsigned i;
+          for (i = 0; i < args[2]; i++)
+            buffer[i] = input_getc ();
+          f->eax = args[2];
+        }
+      else if (number == SYS_WRITE && (int) args[0] == 1)
+        {
+          if (args[2] > 0)
+            putbuf ((const char *) args[1], args[2]);
+          f->eax = args[2];
+        }
+      else
+        f->eax = -1;
       break;
     }
   return;
 
  invalid:
-  /* TODO: 4단계의 공통 exit(-1) 경로로 연결한다. */
+  syscall_exit (-1);
+}
+
+static void
+syscall_exit (int status)
+{
+  thread_current ()->exit_status = status;
   thread_exit ();
 }
 
@@ -140,4 +174,33 @@ check_string (const char *string)
       addr += chunk;
     }
   return false;
+}
+
+int
+fibonacci (int n)
+{
+  unsigned prev = 0;
+  unsigned next = 1;
+  int i;
+
+  for (i = 0; i < n; i++)
+    {
+      unsigned sum = prev + next;
+      prev = next;
+      next = sum;
+    }
+  return (int) prev;
+}
+
+int
+max_of_four_int (int a, int b, int c, int d)
+{
+  int max = a;
+  if (b > max)
+    max = b;
+  if (c > max)
+    max = c;
+  if (d > max)
+    max = d;
+  return max;
 }
