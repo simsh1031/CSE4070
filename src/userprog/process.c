@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -33,7 +34,7 @@ struct child_status
     struct list_elem elem;
   };
 
-static struct lock load_lock;
+struct lock filesys_lock;
 static void release_child (struct child_status *);
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -41,7 +42,7 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
 void
 process_init (void)
 {
-  lock_init (&load_lock);
+  lock_init (&filesys_lock);
 }
 
 static void
@@ -117,9 +118,9 @@ start_process (void *file_name_)
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   thread_current ()->child_status = child;
-  lock_acquire (&load_lock);
+  lock_acquire (&filesys_lock);
   success = load (child->cmdline, &if_.eip, &if_.esp);
-  lock_release (&load_lock);
+  lock_release (&filesys_lock);
   /* 종료 메시지에는 길이가 제한된 thread 이름 대신 전체 파일명을 쓴다. */
   strtok_r (child->cmdline, " ", &save_ptr);
   child->load_success = success;
@@ -175,6 +176,12 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
   struct child_status *child = cur->child_status;
+
+  syscall_close_files ();
+  lock_acquire (&filesys_lock);
+  file_close (cur->executable_file);
+  cur->executable_file = NULL;
+  lock_release (&filesys_lock);
 
   if (child != NULL)
     {
@@ -344,6 +351,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
       goto done; 
     }
 
+  /* load의 FS 접근은 호출자가 잡은 filesys_lock으로 보호한다. */
+  file_deny_write (file);
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -481,6 +490,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
   *eip = (void (*) (void)) ehdr.e_entry;
 
   success = true;
+  t->executable_file = file;
+  file = NULL;
 
  done:
   /* We arrive here whether the load is successful or not. */

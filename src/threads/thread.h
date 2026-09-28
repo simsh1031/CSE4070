@@ -99,6 +99,9 @@ struct thread
     struct list children;
     struct child_status *child_status;
     int exit_status;
+    struct list open_files;
+    int next_fd;
+    struct file *executable_file;
 #endif
 
     /* Owned by thread.c. */

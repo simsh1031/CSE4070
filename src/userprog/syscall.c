@@ -1,10 +1,16 @@
 #include "userprog/syscall.h"
 #include <stdio.h>
+#include <limits.h>
 #include <string.h>
 #include <syscall-nr.h>
 #include "devices/input.h"
 #include "devices/shutdown.h"
+#include "filesys/directory.h"
+#include "filesys/file.h"
+#include "filesys/filesys.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
+#include "threads/synch.h"
 #include "threads/pte.h"
 #include "threads/thread.h"
 #include "userprog/pagedir.h"
@@ -14,6 +20,16 @@ static void syscall_handler (struct intr_frame *);
 static bool check_buffer (const void *, size_t, bool);
 static bool check_string (const char *);
 static void syscall_exit (int status) NO_RETURN;
+
+struct fd_entry
+  {
+    int fd;
+    struct file *file;
+    struct list_elem elem;
+  };
+
+static struct fd_entry *find_fd (int fd);
+static void close_file (struct fd_entry *entry);
 
 void
 syscall_init (void) 
@@ -29,6 +45,8 @@ syscall_handler (struct intr_frame *f)
   uint32_t args[4];
   size_t argc;
   uintptr_t esp = (uintptr_t) f->esp;
+  struct thread *cur = thread_current ();
+  struct fd_entry *entry;
 
   if (!check_buffer (f->esp, sizeof number, false))
     goto invalid;
@@ -43,7 +61,16 @@ syscall_handler (struct intr_frame *f)
     case SYS_EXEC:
     case SYS_WAIT:
     case SYS_FIBONACCI:
+    case SYS_REMOVE:
+    case SYS_OPEN:
+    case SYS_CLOSE:
+    case SYS_FILESIZE:
+    case SYS_TELL:
       argc = 1;
+      break;
+    case SYS_CREATE:
+    case SYS_SEEK:
+      argc = 2;
       break;
     case SYS_READ:
     case SYS_WRITE:
@@ -66,6 +93,72 @@ syscall_handler (struct intr_frame *f)
 
   switch (number)
     {
+    case SYS_CREATE:
+    case SYS_REMOVE:
+    case SYS_OPEN:
+      {
+        const char *user_name = (const char *) args[0];
+        char name[NAME_MAX + 1];
+
+        if (!check_string (user_name))
+          goto invalid;
+        f->eax = number == SYS_OPEN ? -1 : 0;
+        if (strlen (user_name) > NAME_MAX)
+          break;
+        strlcpy (name, user_name, sizeof name);
+        if (number == SYS_OPEN)
+          {
+            if (cur->next_fd == INT_MAX)
+              break;
+            entry = malloc (sizeof *entry);
+            if (entry == NULL)
+              break;
+            lock_acquire (&filesys_lock);
+            entry->file = filesys_open (name);
+            lock_release (&filesys_lock);
+            if (entry->file == NULL)
+              {
+                free (entry);
+                break;
+              }
+            entry->fd = cur->next_fd++;
+            list_push_back (&cur->open_files, &entry->elem);
+            f->eax = entry->fd;
+          }
+        else
+          {
+            if (number == SYS_CREATE && args[1] > INT_MAX)
+              break;
+            lock_acquire (&filesys_lock);
+            f->eax = number == SYS_CREATE
+                     ? filesys_create (name, args[1]) : filesys_remove (name);
+            lock_release (&filesys_lock);
+          }
+        break;
+      }
+    case SYS_CLOSE:
+      entry = find_fd ((int) args[0]);
+      if (entry != NULL)
+        close_file (entry);
+      break;
+    case SYS_FILESIZE:
+    case SYS_SEEK:
+    case SYS_TELL:
+      entry = find_fd ((int) args[0]);
+      f->eax = -1;
+      if (entry == NULL)
+        break;
+      if (number == SYS_SEEK && args[1] > INT_MAX)
+        goto invalid;
+      lock_acquire (&filesys_lock);
+      if (number == SYS_FILESIZE)
+        f->eax = file_length (entry->file);
+      else if (number == SYS_TELL)
+        f->eax = file_tell (entry->file);
+      else
+        file_seek (entry->file, args[1]);
+      lock_release (&filesys_lock);
+      break;
     case SYS_FIBONACCI:
       f->eax = fibonacci ((int) args[0]);
       break;
@@ -106,13 +199,60 @@ syscall_handler (struct intr_frame *f)
           f->eax = args[2];
         }
       else
-        f->eax = -1;
+        {
+          entry = find_fd ((int) args[0]);
+          f->eax = -1;
+          if (entry == NULL || args[2] > INT_MAX)
+            break;
+          lock_acquire (&filesys_lock);
+          f->eax = number == SYS_READ
+                   ? file_read (entry->file, (void *) args[1], args[2])
+                   : file_write (entry->file, (const void *) args[1], args[2]);
+          lock_release (&filesys_lock);
+        }
       break;
     }
   return;
 
  invalid:
   syscall_exit (-1);
+}
+
+/* FD 목록은 현재 프로세스만 접근하므로 FS lock 없이 조회한다. */
+static struct fd_entry *
+find_fd (int fd)
+{
+  struct list *files = &thread_current ()->open_files;
+  struct list_elem *e;
+
+  for (e = list_begin (files); e != list_end (files); e = list_next (e))
+    {
+      struct fd_entry *entry = list_entry (e, struct fd_entry, elem);
+      if (entry->fd == fd)
+        return entry;
+    }
+  return NULL;
+}
+
+/* 호출자는 FS lock을 보유하지 않는다. */
+static void
+close_file (struct fd_entry *entry)
+{
+  list_remove (&entry->elem);
+  lock_acquire (&filesys_lock);
+  file_close (entry->file);
+  lock_release (&filesys_lock);
+  free (entry);
+}
+
+/* 정상 종료와 사용자 예외 종료가 같은 경로에서 파일을 회수한다. */
+void
+syscall_close_files (void)
+{
+  struct list *files = &thread_current ()->open_files;
+
+  while (!list_empty (files))
+    close_file (list_entry (list_front (files), struct fd_entry, elem));
 }
 
 static void
