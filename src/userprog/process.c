@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -15,33 +16,89 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+// 스레드가 먼저 해제되어도 부모가 종료 상태를 읽을 수 있어야 함
+struct child_status
+  {
+    tid_t tid;
+    int status;
+    int refs;
+    bool load_success;
+    char *cmdline;
+    struct semaphore loaded;
+    struct semaphore exited;
+    struct list_elem elem;
+  };
+
+struct lock filesys_lock;
+static void release_child (struct child_status *);
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
-/* Starts a new thread running a user program loaded from
-   FILENAME.  The new thread may be scheduled (and may even exit)
-   before process_execute() returns.  Returns the new process's
-   thread id, or TID_ERROR if the thread cannot be created. */
+void
+process_init (void)
+{
+  lock_init (&filesys_lock);
+}
+
+static void
+release_child (struct child_status *child)
+{
+  enum intr_level old_level = intr_disable ();
+  bool last = --child->refs == 0;
+  intr_set_level (old_level);
+  if (last)
+    free (child);
+}
+
+// 자식의 생성뿐 아니라 실행 파일 로딩 결과까지 기다림
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
   char *fn_copy;
+  struct child_status *child;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  if (strlcpy (fn_copy, file_name, PGSIZE) >= PGSIZE)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  child = malloc (sizeof *child);
+  if (child == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  child->status = -1;
+  child->refs = 2;
+  child->load_success = false;
+  child->cmdline = fn_copy;
+  sema_init (&child->loaded, 0);
+  sema_init (&child->exited, 0);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name, PRI_DEFAULT, start_process, child);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (fn_copy);
+      free (child);
+      return TID_ERROR;
+    }
+  child->tid = tid;
+  list_push_back (&thread_current ()->children, &child->elem);
+  sema_down (&child->loaded);
+  if (!child->load_success)
+    {
+      process_wait (tid);
+      return TID_ERROR;
+    }
   return tid;
 }
 
@@ -50,7 +107,8 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  struct child_status *child = file_name_;
+  char *save_ptr;
   struct intr_frame if_;
   bool success;
 
@@ -59,10 +117,16 @@ start_process (void *file_name_)
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  thread_current ()->child_status = child;
+  lock_acquire (&filesys_lock);
+  success = load (child->cmdline, &if_.eip, &if_.esp);
+  lock_release (&filesys_lock);
+  // 종료 메시지에는 길이가 제한된 thread 이름 대신 전체 파일명을 씀
+  strtok_r (child->cmdline, " ", &save_ptr);
+  child->load_success = success;
+  sema_up (&child->loaded);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
   if (!success) 
     thread_exit ();
 
@@ -82,12 +146,26 @@ start_process (void *file_name_)
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
    immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+ */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid)
 {
+  struct list *children = &thread_current ()->children;
+  struct list_elem *e;
+
+  for (e = list_begin (children); e != list_end (children); e = list_next (e))
+    {
+      struct child_status *child = list_entry (e, struct child_status, elem);
+      if (child->tid == child_tid)
+        {
+          int status;
+          list_remove (e);
+          sema_down (&child->exited);
+          status = child->status;
+          release_child (child);
+          return status;
+        }
+    }
   return -1;
 }
 
@@ -97,6 +175,28 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  struct child_status *child = cur->child_status;
+
+  syscall_close_files ();
+  lock_acquire (&filesys_lock);
+  file_close (cur->executable_file);
+  cur->executable_file = NULL;
+  lock_release (&filesys_lock);
+
+  if (child != NULL)
+    {
+      if (child->load_success)
+        {
+          const char *name = child->cmdline;
+          while (*name == ' ')
+            name++;
+          printf ("%s: exit(%d)\n", name, cur->exit_status);
+        }
+      palloc_free_page (child->cmdline);
+    }
+  while (!list_empty (&cur->children))
+    release_child (list_entry (list_pop_front (&cur->children),
+                               struct child_status, elem));
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -113,6 +213,13 @@ process_exit (void)
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
+    }
+  if (child != NULL)
+    {
+      child->status = cur->exit_status;
+      sema_up (&child->exited);
+      cur->child_status = NULL;
+      release_child (child);
     }
 }
 
@@ -213,7 +320,22 @@ load (const char *file_name, void (**eip) (void), void **esp)
   struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
+  char *cmdline = NULL;
+  char **argv = NULL;
+  char *token, *save_ptr;
   int i;
+
+  // ELF를 열기 위해 실행 파일명만 먼저 분리함
+  cmdline = palloc_get_page (0);
+  if (cmdline == NULL)
+    goto done;
+  if (strlcpy (cmdline, file_name, PGSIZE) >= PGSIZE)
+    goto done;
+  token = strtok_r (cmdline, " ", &save_ptr);
+  if (token == NULL)
+    goto done;
+  file_name = token;
+  strlcpy (t->name, file_name, sizeof t->name);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -229,6 +351,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
       goto done; 
     }
 
+  // load의 FS 접근은 호출자가 잡은 filesys_lock으로 보호함
+  file_deny_write (file);
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -305,14 +429,75 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp))
     goto done;
 
+  {
+    size_t size = 0;
+    size_t padding;
+    char *sp = *esp;
+    char **user_argv;
+    int argc = 0;
+
+    // 인자를 모두 파싱한 뒤 사용자 스택에 배치함
+    argv = palloc_get_page (0);
+    if (argv == NULL)
+      goto done;
+    for (; token != NULL; token = strtok_r (NULL, " ", &save_ptr))
+      {
+        if ((size_t) argc >= PGSIZE / sizeof *argv)
+          goto done;
+        argv[argc++] = token;
+      }
+
+    // 문자열뿐 아니라 포인터와 호출 프레임도 한 페이지 안에 들어가야 함
+    for (i = 0; i < argc; i++)
+      {
+        size_t length = strlen (argv[i]) + 1;
+        if (length > PGSIZE - size)
+          goto done;
+        size += length;
+      }
+    padding = (4 - size % 4) % 4;
+    if (size + padding > PGSIZE
+        || (size_t) argc + 4 > (PGSIZE - size - padding) / 4)
+      goto done;
+
+    for (i = argc - 1; i >= 0; i--)
+      {
+        size_t length = strlen (argv[i]) + 1;
+        sp -= length;
+        memcpy (sp, argv[i], length);
+        argv[i] = sp;
+      }
+    sp -= padding;
+    memset (sp, 0, padding);
+    sp -= sizeof (char *);
+    *(char **) sp = NULL;
+    for (i = argc - 1; i >= 0; i--)
+      {
+        sp -= sizeof (char *);
+        *(char **) sp = argv[i];
+      }
+    user_argv = (char **) sp;
+    sp -= sizeof (char **);
+    *(char ***) sp = user_argv;
+    sp -= sizeof (int);
+    *(int *) sp = argc;
+    sp -= sizeof (void *);
+    *(void **) sp = NULL;
+    *esp = sp;
+  }
+
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
   success = true;
+  t->executable_file = file;
+  file = NULL;
 
  done:
   /* We arrive here whether the load is successful or not. */
   file_close (file);
+  palloc_free_page (argv);
+  palloc_free_page (cmdline);
   return success;
 }
 
