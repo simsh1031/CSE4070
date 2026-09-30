@@ -3,7 +3,7 @@
 
 #include "threads/thread.h"
 
-/* syscall, loader, 종료 정리가 공유하는 파일 시스템 lock. */
+// syscall, loader, 종료 정리가 파일 시스템 lock을 공유함
 extern struct lock filesys_lock;
 
 void process_init (void);

@@ -21,7 +21,7 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
-/* 스레드가 먼저 해제되어도 부모가 종료 상태를 읽을 수 있어야 한다. */
+// 스레드가 먼저 해제되어도 부모가 종료 상태를 읽을 수 있어야 함
 struct child_status
   {
     tid_t tid;
@@ -55,7 +55,7 @@ release_child (struct child_status *child)
     free (child);
 }
 
-/* 자식의 생성뿐 아니라 실행 파일 로딩 결과까지 기다린다. */
+// 자식의 생성뿐 아니라 실행 파일 로딩 결과까지 기다림
 tid_t
 process_execute (const char *file_name)
 {
@@ -121,7 +121,7 @@ start_process (void *file_name_)
   lock_acquire (&filesys_lock);
   success = load (child->cmdline, &if_.eip, &if_.esp);
   lock_release (&filesys_lock);
-  /* 종료 메시지에는 길이가 제한된 thread 이름 대신 전체 파일명을 쓴다. */
+  // 종료 메시지에는 길이가 제한된 thread 이름 대신 전체 파일명을 씀
   strtok_r (child->cmdline, " ", &save_ptr);
   child->load_success = success;
   sema_up (&child->loaded);
@@ -325,7 +325,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   char *token, *save_ptr;
   int i;
 
-  /* ELF를 열기 위해 실행 파일명만 먼저 분리한다. */
+  // ELF를 열기 위해 실행 파일명만 먼저 분리함
   cmdline = palloc_get_page (0);
   if (cmdline == NULL)
     goto done;
@@ -351,7 +351,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
       goto done; 
     }
 
-  /* load의 FS 접근은 호출자가 잡은 filesys_lock으로 보호한다. */
+  // load의 FS 접근은 호출자가 잡은 filesys_lock으로 보호함
   file_deny_write (file);
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -436,7 +436,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
     char **user_argv;
     int argc = 0;
 
-    /* 인자를 모두 파싱한 뒤 사용자 스택에 배치한다. */
+    // 인자를 모두 파싱한 뒤 사용자 스택에 배치함
     argv = palloc_get_page (0);
     if (argv == NULL)
       goto done;
@@ -447,7 +447,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
         argv[argc++] = token;
       }
 
-    /* 문자열뿐 아니라 포인터와 호출 프레임도 한 페이지 안에 들어가야 한다. */
+    // 문자열뿐 아니라 포인터와 호출 프레임도 한 페이지 안에 들어가야 함
     for (i = 0; i < argc; i++)
       {
         size_t length = strlen (argv[i]) + 1;

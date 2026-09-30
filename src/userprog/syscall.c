@@ -173,7 +173,7 @@ syscall_handler (struct intr_frame *f)
     case SYS_EXEC:
       if (!check_string ((const char *) args[0]))
         goto invalid;
-      /* process_execute가 자식 생성 전에 명령행을 커널 페이지로 복사한다. */
+      // process_execute가 자식 생성 전에 명령행을 커널 페이지로 복사함
       f->eax = process_execute ((const char *) args[0]);
       break;
     case SYS_WAIT:
@@ -218,7 +218,7 @@ syscall_handler (struct intr_frame *f)
   syscall_exit (-1);
 }
 
-/* FD 목록은 현재 프로세스만 접근하므로 FS lock 없이 조회한다. */
+// FD 목록은 현재 프로세스만 접근하므로 FS lock 없이 조회함
 static struct fd_entry *
 find_fd (int fd)
 {
@@ -234,7 +234,7 @@ find_fd (int fd)
   return NULL;
 }
 
-/* 호출자는 FS lock을 보유하지 않는다. */
+// 호출자는 FS lock을 보유하지 않음
 static void
 close_file (struct fd_entry *entry)
 {
@@ -245,7 +245,7 @@ close_file (struct fd_entry *entry)
   free (entry);
 }
 
-/* 정상 종료와 사용자 예외 종료가 같은 경로에서 파일을 회수한다. */
+// 정상 종료와 사용자 예외 종료가 같은 경로에서 파일을 회수함
 void
 syscall_close_files (void)
 {
@@ -262,7 +262,7 @@ syscall_exit (int status)
   thread_exit ();
 }
 
-/* 시작 주소만 검사하면 페이지 경계에 걸친 인자를 놓칠 수 있다. */
+// 시작 주소만 검사하면 페이지 경계에 걸친 인자를 놓칠 수 있음
 static bool
 check_buffer (const void *buffer, size_t size, bool write)
 {

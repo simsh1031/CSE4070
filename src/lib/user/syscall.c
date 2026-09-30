@@ -61,7 +61,7 @@
           retval;                                               \
         })
 
-/* push 중 esp가 변하므로 인자는 모두 레지스터로 전달한다. */
+// push 중 esp가 변하므로 인자는 모두 레지스터로 전달함
 #define syscall4(NUMBER, ARG0, ARG1, ARG2, ARG3)                 \
         ({                                                      \
           int retval;                                           \
