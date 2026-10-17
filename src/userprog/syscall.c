@@ -47,6 +47,7 @@ syscall_handler (struct intr_frame *f)
   uintptr_t esp = (uintptr_t) f->esp;
   struct thread *cur = thread_current ();
   struct fd_entry *entry;
+  char name[NAME_MAX + 1];
 
   if (!check_buffer (f->esp, sizeof number, false))
     goto invalid;
@@ -94,69 +95,81 @@ syscall_handler (struct intr_frame *f)
   switch (number)
     {
     case SYS_CREATE:
-    case SYS_REMOVE:
-    case SYS_OPEN:
-      {
-        const char *user_name = (const char *) args[0];
-        char name[NAME_MAX + 1];
-
-        if (!check_string (user_name))
-          goto invalid;
-        f->eax = number == SYS_OPEN ? -1 : 0;
-        if (strlen (user_name) > NAME_MAX)
-          break;
-        strlcpy (name, user_name, sizeof name);
-        if (number == SYS_OPEN)
-          {
-            if (cur->next_fd == INT_MAX)
-              break;
-            entry = malloc (sizeof *entry);
-            if (entry == NULL)
-              break;
-            lock_acquire (&filesys_lock);
-            entry->file = filesys_open (name);
-            lock_release (&filesys_lock);
-            if (entry->file == NULL)
-              {
-                free (entry);
-                break;
-              }
-            entry->fd = cur->next_fd++;
-            list_push_back (&cur->open_files, &entry->elem);
-            f->eax = entry->fd;
-          }
-        else
-          {
-            if (number == SYS_CREATE && args[1] > INT_MAX)
-              break;
-            lock_acquire (&filesys_lock);
-            f->eax = number == SYS_CREATE
-                     ? filesys_create (name, args[1]) : filesys_remove (name);
-            lock_release (&filesys_lock);
-          }
+      if (!check_string ((const char *) args[0]))
+        goto invalid;
+      f->eax = false;
+      if (strlen ((const char *) args[0]) > NAME_MAX || args[1] > INT_MAX)
         break;
-      }
+      strlcpy (name, (const char *) args[0], sizeof name);
+      lock_acquire (&filesys_lock);
+      f->eax = filesys_create (name, args[1]);
+      lock_release (&filesys_lock);
+      break;
+    case SYS_REMOVE:
+      if (!check_string ((const char *) args[0]))
+        goto invalid;
+      f->eax = false;
+      if (strlen ((const char *) args[0]) > NAME_MAX)
+        break;
+      strlcpy (name, (const char *) args[0], sizeof name);
+      lock_acquire (&filesys_lock);
+      f->eax = filesys_remove (name);
+      lock_release (&filesys_lock);
+      break;
+    case SYS_OPEN:
+      if (!check_string ((const char *) args[0]))
+        goto invalid;
+      f->eax = -1;
+      if (strlen ((const char *) args[0]) > NAME_MAX
+          || cur->next_fd == INT_MAX)
+        break;
+      strlcpy (name, (const char *) args[0], sizeof name);
+      entry = malloc (sizeof *entry);
+      if (entry == NULL)
+        break;
+      lock_acquire (&filesys_lock);
+      entry->file = filesys_open (name);
+      lock_release (&filesys_lock);
+      if (entry->file == NULL)
+        {
+          free (entry);
+          break;
+        }
+      entry->fd = cur->next_fd++;
+      list_push_back (&cur->open_files, &entry->elem);
+      f->eax = entry->fd;
+      break;
     case SYS_CLOSE:
       entry = find_fd ((int) args[0]);
       if (entry != NULL)
         close_file (entry);
       break;
     case SYS_FILESIZE:
+      entry = find_fd ((int) args[0]);
+      f->eax = -1;
+      if (entry == NULL)
+        break;
+      lock_acquire (&filesys_lock);
+      f->eax = file_length (entry->file);
+      lock_release (&filesys_lock);
+      break;
     case SYS_SEEK:
+      entry = find_fd ((int) args[0]);
+      if (entry == NULL)
+        break;
+      if (args[1] > INT_MAX)
+        goto invalid;
+      lock_acquire (&filesys_lock);
+      file_seek (entry->file, args[1]);
+      lock_release (&filesys_lock);
+      break;
     case SYS_TELL:
       entry = find_fd ((int) args[0]);
       f->eax = -1;
       if (entry == NULL)
         break;
-      if (number == SYS_SEEK && args[1] > INT_MAX)
-        goto invalid;
       lock_acquire (&filesys_lock);
-      if (number == SYS_FILESIZE)
-        f->eax = file_length (entry->file);
-      else if (number == SYS_TELL)
-        f->eax = file_tell (entry->file);
-      else
-        file_seek (entry->file, args[1]);
+      f->eax = file_tell (entry->file);
       lock_release (&filesys_lock);
       break;
     case SYS_FIBONACCI:
@@ -180,11 +193,9 @@ syscall_handler (struct intr_frame *f)
       f->eax = process_wait ((tid_t) args[0]);
       break;
     case SYS_READ:
-    case SYS_WRITE:
-      if (!check_buffer ((const void *) args[1], args[2],
-                         number == SYS_READ))
+      if (!check_buffer ((void *) args[1], args[2], true))
         goto invalid;
-      if (number == SYS_READ && (int) args[0] == 0)
+      if ((int) args[0] == 0)
         {
           uint8_t *buffer = (uint8_t *) args[1];
           unsigned i;
@@ -192,7 +203,21 @@ syscall_handler (struct intr_frame *f)
             buffer[i] = input_getc ();
           f->eax = args[2];
         }
-      else if (number == SYS_WRITE && (int) args[0] == 1)
+      else
+        {
+          entry = find_fd ((int) args[0]);
+          f->eax = -1;
+          if (entry == NULL || args[2] > INT_MAX)
+            break;
+          lock_acquire (&filesys_lock);
+          f->eax = file_read (entry->file, (void *) args[1], args[2]);
+          lock_release (&filesys_lock);
+        }
+      break;
+    case SYS_WRITE:
+      if (!check_buffer ((const void *) args[1], args[2], false))
+        goto invalid;
+      if ((int) args[0] == 1)
         {
           if (args[2] > 0)
             putbuf ((const char *) args[1], args[2]);
@@ -205,9 +230,7 @@ syscall_handler (struct intr_frame *f)
           if (entry == NULL || args[2] > INT_MAX)
             break;
           lock_acquire (&filesys_lock);
-          f->eax = number == SYS_READ
-                   ? file_read (entry->file, (void *) args[1], args[2])
-                   : file_write (entry->file, (const void *) args[1], args[2]);
+          f->eax = file_write (entry->file, (const void *) args[1], args[2]);
           lock_release (&filesys_lock);
         }
       break;

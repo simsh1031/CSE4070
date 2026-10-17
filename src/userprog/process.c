@@ -49,7 +49,10 @@ static void
 release_child (struct child_status *child)
 {
   enum intr_level old_level = intr_disable ();
-  bool last = --child->refs == 0;
+  bool last;
+
+  child->refs--;
+  last = child->refs == 0;
   intr_set_level (old_level);
   if (last)
     free (child);
@@ -238,7 +241,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -456,8 +459,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
         size += length;
       }
     padding = (4 - size % 4) % 4;
-    if (size + padding > PGSIZE
-        || (size_t) argc + 4 > (PGSIZE - size - padding) / 4)
+    if (size + padding + (argc + 4) * sizeof (void *) > PGSIZE)
       goto done;
 
     for (i = argc - 1; i >= 0; i--)
@@ -500,7 +502,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   palloc_free_page (cmdline);
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -648,3 +650,4 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
