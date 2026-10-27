@@ -4,6 +4,12 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
+
+#ifndef USERPROG
+extern bool thread_prior_aging;
+#endif
+
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -74,12 +80,9 @@ typedef int tid_t;
    the `magic' member of the running thread's `struct thread' is
    set to THREAD_MAGIC.  Stack overflow will normally change this
    value, triggering the assertion. */
-/* The `elem' member has a dual purpose.  It can be an element in
-   the run queue (thread.c), or it can be an element in a
-   semaphore wait list (synch.c).  It can be used these two ways
-   only because they are mutually exclusive: only a thread in the
-   ready state is on the run queue, whereas only a thread in the
-   blocked state is on a semaphore wait list. */
+/* The `elem' member belongs to the ready queue, sleep queue, or
+   a semaphore wait list.  A thread belongs to only one at a time;
+   waking it removes it from its wait queue before it becomes ready. */
 struct thread
   {
     /* Owned by thread.c. */
@@ -88,6 +91,8 @@ struct thread
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
     int priority;                       /* Priority. */
+    int64_t wake_tick;                   /* Timer tick at which sleep ends. */
+    int64_t ready_tick;
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
@@ -124,6 +129,8 @@ tid_t thread_create (const char *name, int priority, thread_func *, void *);
 
 void thread_block (void);
 void thread_unblock (struct thread *);
+void thread_sleep (int64_t wake_tick);
+void thread_wake_up (void);
 
 struct thread *thread_current (void);
 tid_t thread_tid (void);
@@ -138,6 +145,9 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
+bool thread_priority_less (const struct list_elem *,
+                           const struct list_elem *, void *);
+void thread_preempt (void);
 
 int thread_get_nice (void);
 void thread_set_nice (int);

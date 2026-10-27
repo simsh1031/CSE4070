@@ -4,6 +4,7 @@
 #include <random.h>
 #include <stdio.h>
 #include <string.h>
+#include "devices/timer.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -23,6 +24,7 @@
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list ready_list;
+static struct list sleep_list;
 
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
@@ -54,6 +56,10 @@ static long long user_ticks;    /* # of timer ticks in user programs. */
 #define TIME_SLICE 4            /* # of timer ticks to give each thread. */
 static unsigned thread_ticks;   /* # of timer ticks since last yield. */
 
+#ifndef USERPROG
+bool thread_prior_aging;
+#endif
+
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
@@ -70,6 +76,9 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+#ifndef USERPROG
+static void thread_aging (void);
+#endif
 
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -91,6 +100,7 @@ thread_init (void)
 
   lock_init (&tid_lock);
   list_init (&ready_list);
+  list_init (&sleep_list);
   list_init (&all_list);
 
   /* Set up a thread structure for the running thread. */
@@ -137,7 +147,18 @@ thread_tick (void)
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+
+  thread_wake_up();
+#ifndef USERPROG
+  if (thread_prior_aging == true)
+    thread_aging();
+#endif
+
+  thread_preempt ();
 }
+
+
+
 
 /* Prints thread statistics. */
 void
@@ -200,6 +221,7 @@ thread_create (const char *name, int priority,
 
   /* Add to run queue. */
   thread_unblock (t);
+  thread_preempt ();
 
   return tid;
 }
@@ -220,6 +242,66 @@ thread_block (void)
   schedule ();
 }
 
+/* Keep interrupts off from queue insertion through blocking. */
+void
+thread_sleep (int64_t wake_tick)
+{
+  struct thread *cur = thread_current ();
+
+  ASSERT (!intr_context ());
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  cur->wake_tick = wake_tick;
+  list_push_back (&sleep_list, &cur->elem);
+  thread_block ();
+}
+
+void
+thread_wake_up (void)
+{
+  struct list_elem *e = list_begin (&sleep_list);
+  int64_t now = timer_ticks ();
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  while (e != list_end (&sleep_list))
+    {
+      struct thread *t = list_entry (e, struct thread, elem);
+      if (t->wake_tick <= now)
+        {
+          e = list_remove (e);
+          thread_unblock (t);
+        }
+      else
+        e = list_next (e);
+    }
+}
+
+#ifndef USERPROG
+static void
+thread_aging (void)
+{
+  struct list_elem *e;
+  int64_t now = timer_ticks ();
+
+  /* Keep the existing activation hook until Aging is implemented. */
+  for (e = list_begin (&ready_list); e != list_end (&ready_list);
+       e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, elem);
+      if (t != idle_thread && t->ready_tick < now)
+        {
+          int64_t waited = now - t->ready_tick;
+          if (waited >= PRI_MAX - t->priority)
+            t->priority = PRI_MAX;
+          else
+            t->priority += waited;
+          t->ready_tick = now;
+        }
+    }
+}
+#endif
+
 /* Transitions a blocked thread T to the ready-to-run state.
    This is an error if T is not blocked.  (Use thread_yield() to
    make the running thread ready.)
@@ -237,8 +319,15 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
+  t->ready_tick = timer_ticks ();
   list_push_back (&ready_list, &t->elem);
   t->status = THREAD_READY;
+  if (intr_context ())
+    {
+      struct thread *cur = thread_current ();
+      if (cur == idle_thread || t->priority > cur->priority)
+        intr_yield_on_return ();
+    }
   intr_set_level (old_level);
 }
 
@@ -308,7 +397,10 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    {
+      cur->ready_tick = timer_ticks ();
+      list_push_back (&ready_list, &cur->elem);
+    }
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -335,7 +427,45 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  enum intr_level old_level = intr_disable ();
+
+  ASSERT (PRI_MIN <= new_priority && new_priority <= PRI_MAX);
   thread_current ()->priority = new_priority;
+  thread_preempt ();
+  intr_set_level (old_level);
+}
+
+bool
+thread_priority_less (const struct list_elem *a,
+                      const struct list_elem *b, void *aux UNUSED)
+{
+  const struct thread *ta = list_entry (a, struct thread, elem);
+  const struct thread *tb = list_entry (b, struct thread, elem);
+
+  return ta->priority < tb->priority;
+}
+
+void
+thread_preempt (void)
+{
+  enum intr_level old_level = intr_disable ();
+
+  if (!list_empty (&ready_list))
+    {
+      struct thread *next = list_entry (
+        list_max (&ready_list, thread_priority_less, NULL),
+        struct thread, elem);
+      struct thread *cur = thread_current ();
+
+      if (cur == idle_thread || next->priority > cur->priority)
+        {
+          if (intr_context ())
+            intr_yield_on_return ();
+          else
+            thread_yield ();
+        }
+    }
+  intr_set_level (old_level);
 }
 
 /* Returns the current thread's priority. */
@@ -499,7 +629,11 @@ next_thread_to_run (void)
   if (list_empty (&ready_list))
     return idle_thread;
   else
-    return list_entry (list_pop_front (&ready_list), struct thread, elem);
+    {
+      struct list_elem *e = list_max (&ready_list, thread_priority_less, NULL);
+      list_remove (e);
+      return list_entry (e, struct thread, elem);
+    }
 }
 
 /* Completes a thread switch by activating the new thread's page
