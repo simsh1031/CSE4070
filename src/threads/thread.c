@@ -56,6 +56,9 @@ static long long user_ticks;    /* # of timer ticks in user programs. */
 #define TIME_SLICE 4            /* # of timer ticks to give each thread. */
 static unsigned thread_ticks;   /* # of timer ticks since last yield. */
 
+#define FP_ONE (1 << 14)
+static int32_t load_avg;
+
 #ifndef USERPROG
 bool thread_prior_aging;
 #endif
@@ -76,6 +79,11 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+static int32_t fixed_mul (int32_t, int32_t);
+static int32_t fixed_div (int32_t, int32_t);
+static int fixed_round (int64_t);
+static void thread_bsd_priority (struct thread *);
+static void thread_bsd_tick (void);
 #ifndef USERPROG
 static void thread_aging (void);
 #endif
@@ -102,6 +110,7 @@ thread_init (void)
   list_init (&ready_list);
   list_init (&sleep_list);
   list_init (&all_list);
+  load_avg = 0;
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -149,8 +158,10 @@ thread_tick (void)
     intr_yield_on_return ();
 
   thread_wake_up();
+  if (thread_mlfqs)
+    thread_bsd_tick ();
 #ifndef USERPROG
-  if (thread_prior_aging == true)
+  if (thread_prior_aging == true && !thread_mlfqs)
     thread_aging();
 #endif
 
@@ -427,7 +438,11 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  enum intr_level old_level = intr_disable ();
+  enum intr_level old_level;
+
+  if (thread_mlfqs)
+    return;
+  old_level = intr_disable ();
 
   ASSERT (PRI_MIN <= new_priority && new_priority <= PRI_MAX);
   thread_current ()->priority = new_priority;
@@ -477,9 +492,20 @@ thread_get_priority (void)
 
 /* Sets the current thread's nice value to NICE. */
 void
-thread_set_nice (int nice UNUSED) 
+thread_set_nice (int nice)
 {
   /* Not yet implemented. */
+  enum intr_level old_level = intr_disable ();
+  struct thread *cur = thread_current ();
+
+  ASSERT (nice >= -20 && nice <= 20);
+  cur->nice = nice;
+  if (thread_mlfqs)
+    {
+      thread_bsd_priority (cur);
+      thread_preempt ();
+    }
+  intr_set_level (old_level);
 }
 
 /* Returns the current thread's nice value. */
@@ -487,7 +513,7 @@ int
 thread_get_nice (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return thread_current ()->nice;
 }
 
 /* Returns 100 times the system load average. */
@@ -495,7 +521,11 @@ int
 thread_get_load_avg (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  enum intr_level old_level = intr_disable ();
+  int value = fixed_round ((int64_t) load_avg * 100);
+
+  intr_set_level (old_level);
+  return value;
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
@@ -503,7 +533,83 @@ int
 thread_get_recent_cpu (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  enum intr_level old_level = intr_disable ();
+  int value = fixed_round ((int64_t) thread_current ()->recent_cpu * 100);
+
+  intr_set_level (old_level);
+  return value;
+}
+
+static int32_t
+fixed_mul (int32_t a, int32_t b)
+{
+  return (int64_t) a * b / FP_ONE;
+}
+
+static int32_t
+fixed_div (int32_t a, int32_t b)
+{
+  return (int64_t) a * FP_ONE / b;
+}
+
+static int
+fixed_round (int64_t value)
+{
+  if (value >= 0)
+    return (value + FP_ONE / 2) / FP_ONE;
+  else
+    return (value - FP_ONE / 2) / FP_ONE;
+}
+
+static void
+thread_bsd_priority (struct thread *t)
+{
+  int priority;
+
+  if (t == idle_thread)
+    return;
+  priority = PRI_MAX - t->recent_cpu / (4 * FP_ONE) - 2 * t->nice;
+  if (priority < PRI_MIN)
+    priority = PRI_MIN;
+  if (priority > PRI_MAX)
+    priority = PRI_MAX;
+  t->priority = priority;
+}
+
+static void
+thread_bsd_tick (void)
+{
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  int64_t now = timer_ticks ();
+
+  ASSERT (intr_get_level () == INTR_OFF);
+  if (cur != idle_thread)
+    cur->recent_cpu += FP_ONE;
+
+  if (now % TIMER_FREQ == 0)
+    {
+      int ready_threads = list_size (&ready_list);
+      int32_t coefficient;
+
+      if (cur != idle_thread)
+        ready_threads++;
+      load_avg = ((int64_t) 59 * load_avg + ready_threads * FP_ONE) / 60;
+      coefficient = fixed_div (2 * load_avg, 2 * load_avg + FP_ONE);
+      for (e = list_begin (&all_list); e != list_end (&all_list);
+           e = list_next (e))
+        {
+          struct thread *t = list_entry (e, struct thread, allelem);
+          if (t != idle_thread)
+            t->recent_cpu = fixed_mul (coefficient, t->recent_cpu)
+                            + t->nice * FP_ONE;
+        }
+    }
+
+  if (now % 4 == 0)
+    for (e = list_begin (&all_list); e != list_end (&all_list);
+         e = list_next (e))
+      thread_bsd_priority (list_entry (e, struct thread, allelem));
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -601,6 +707,11 @@ init_thread (struct thread *t, const char *name, int priority)
 #endif
 
   old_level = intr_disable ();
+  if (thread_mlfqs && t != initial_thread)
+    {
+      t->nice = thread_current ()->nice;
+      t->recent_cpu = thread_current ()->recent_cpu;
+    }
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
 }

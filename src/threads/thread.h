@@ -93,6 +93,8 @@ struct thread
     int priority;                       /* Priority. */
     int64_t wake_tick;                   /* Timer tick at which sleep ends. */
     int64_t ready_tick;
+    int nice;
+    int32_t recent_cpu;
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
